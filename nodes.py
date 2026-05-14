@@ -11,6 +11,9 @@ import torch
 from PIL import Image
 import numpy as np
 from tqdm import tqdm
+import json
+import os
+import folder_paths
 
 from . import utils
 
@@ -228,28 +231,118 @@ class LoraTriggerWords:
     CATEGORY = "Civitai"
 
     def execute(self, lora_name, force_refresh):
-        metadata_triggers_list = utils.sort_tags_by_frequency(
-            utils.get_metadata(lora_name, "loras")
-        )
+        metadata_triggers_list = []
         civitai_triggers_list = []
+
+        #
+        # FIRST PRIORITY:
+        # Try loading local <NODE_FILE_NAME>.metadata.json
+        #
+
+        try:
+            # Resolve actual LoRA path
+            lora_path = folder_paths.get_full_path("loras",lora_name)
+
+
+            print(
+                f"[{self.__class__.__name__}] "
+                f"lora_path={lora_path}."
+            )
+
+            if lora_path:
+                # Remove extension entirely
+                base_path, _ = os.path.splitext(lora_path)
+
+                # Required format:
+                # <NODE_FILE_NAME>.metadata.json
+                metadata_json_path = f"{base_path}.metadata.json"
+
+                if os.path.exists(metadata_json_path):
+                    with open(metadata_json_path, "r", encoding="utf-8") as f:
+                        metadata_json = json.load(f)
+
+                    trained_words = (
+                        metadata_json.get("civitai", {})
+                        .get("trainedWords", [])
+                    )
+
+                    if isinstance(trained_words, list):
+                        metadata_triggers_list = [
+                            str(tag).strip()
+                            for tag in trained_words
+                            if str(tag).strip()
+                        ]
+
+                    print(
+                        f"[{self.__class__.__name__}] Loaded "
+                        f"{len(metadata_triggers_list)} trigger words "
+                        f"from local metadata JSON."
+                    )
+                else:
+                    print(
+                        f"[{self.__class__.__name__}] "
+                        f"Local metadata JSON not found: {metadata_json_path}"
+                    )
+
+        except Exception as e:
+            print(
+                f"[{self.__class__.__name__}] "
+                f"Failed reading local metadata JSON: {e}"
+            )
+
+        #
+        # FALLBACK:
+        # Original metadata implementation
+        #
+        if not metadata_triggers_list:
+            try:
+                metadata_triggers_list = utils.sort_tags_by_frequency(
+                    utils.get_metadata(lora_name, "loras")
+                )
+
+                print(
+                    f"[{self.__class__.__name__}] "
+                    f"Using fallback metadata extraction."
+                )
+
+            except Exception as e:
+                print(
+                    f"[{self.__class__.__name__}] "
+                    f"Fallback metadata extraction failed: {e}"
+                )
+
+        #
+        # FINAL FALLBACK:
+        # Civitai API
+        #
         try:
             _, filename_to_hash = utils.get_local_model_maps("loras")
             file_hash = filename_to_hash.get(lora_name)
+
             if file_hash:
                 civitai_triggers_list = utils.get_civitai_triggers(
-                    lora_name, file_hash, force_refresh
+                    lora_name,
+                    file_hash,
+                    force_refresh,
                 )
             else:
                 print(
-                    f"[{self.__class__.__name__}] Could not find hash for {lora_name} in DB."
+                    f"[{self.__class__.__name__}] "
+                    f"Could not find hash for {lora_name} in DB."
                 )
+
         except Exception as e:
-            print(f"[{self.__class__.__name__}] Failed to get civitai triggers: {e}")
+            print(
+                f"[{self.__class__.__name__}] "
+                f"Failed to get civitai triggers: {e}"
+            )
+
         metadata_triggers_str = (
             ", \n".join(metadata_triggers_list)
             if metadata_triggers_list
             else "[No Data Found]"
         )
+
         civitai_triggers_str = (
             ", ".join(civitai_triggers_list)
             if civitai_triggers_list
@@ -259,18 +352,30 @@ class LoraTriggerWords:
         def create_trigger_table(trigger_list, title):
             if not trigger_list:
                 return f"| {title} |\n|:---|\n| *[No Data Found]* |"
+
             lines = [f"| {title} |", "|:---|"]
             lines.extend([f"| `{tag}` |" for tag in trigger_list])
+
             return "\n".join(lines)
 
         metadata_table = create_trigger_table(
-            metadata_triggers_list, "Triggers from Metadata"
+            metadata_triggers_list,
+            "Triggers from Metadata",
         )
+
         civitai_table = create_trigger_table(
-            civitai_triggers_list, "Triggers from Civitai API"
+            civitai_triggers_list,
+            "Triggers from Civitai API",
         )
+
         triggers_md = f"{metadata_table}\n\n{civitai_table}"
-        return (metadata_triggers_str, civitai_triggers_str, triggers_md)
+
+        return (
+            metadata_triggers_str,
+            civitai_triggers_str,
+            triggers_md,
+        )
+
 
 
 # =================================================================================
