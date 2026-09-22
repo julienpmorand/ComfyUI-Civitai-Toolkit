@@ -251,14 +251,14 @@ class DatabaseManager:
 
             conn.execute(
                 """
-                INSERT INTO versions (hash, version_id, model_id, name, trained_words, api_response, last_api_check) 
+                INSERT INTO versions (hash, version_id, model_id, name, trained_words, api_response, last_api_check)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(hash) DO UPDATE SET 
-                    version_id = excluded.version_id, 
-                    model_id = excluded.model_id, 
+                ON CONFLICT(hash) DO UPDATE SET
+                    version_id = excluded.version_id,
+                    model_id = excluded.model_id,
                     name = excluded.name,
-                    trained_words = excluded.trained_words, 
-                    api_response = excluded.api_response, 
+                    trained_words = excluded.trained_words,
+                    api_response = excluded.api_response,
                     last_api_check = excluded.last_api_check
                 """,
                 (
@@ -761,11 +761,17 @@ def get_local_model_maps(model_type: str, force_sync=False):
 
     # 3. 遍历列表，构建新的映射
     for relative_path in known_relative_paths:
-        full_path = os.path.normpath(
-            folder_paths.get_full_path(model_type, relative_path)
-        )
+        full_path = folder_paths.get_full_path(model_type, relative_path)
 
-        # 从我们的数据库中查找这个文件的哈希
+        if not full_path:
+            print(
+                f"[Civitai Toolkit] Warning: skipping unresolved "
+                f"{model_type} file: {relative_path}"
+            )
+            continue
+
+        full_path = os.path.normpath(full_path)
+
         file_hash = abs_path_to_hash.get(full_path)
 
         if file_hash:
@@ -774,75 +780,183 @@ def get_local_model_maps(model_type: str, force_sync=False):
 
     return hash_to_filename, filename_to_hash
 
-
 def get_model_filenames_from_db_cached_only(model_type: str):
     """
-    一个绝对安全的函数，只从数据库缓存中读取模型列表，绝不触发扫描。
-    专门用于UI加载，确保启动速度。
-    如果数据库为空，则回退到显示文件夹中的所有模型。
+    Read model list only from the DB cache without triggering a scan.
+    Falls back to folder_paths when the DB has no matching entries.
     """
     with db_manager.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT local_path FROM versions WHERE model_type = ? AND local_path IS NOT NULL ORDER BY local_path ASC",
+            "SELECT local_path FROM versions "
+            "WHERE model_type = ? AND local_path IS NOT NULL "
+            "ORDER BY local_path ASC",
             (model_type,),
         )
         rows = cursor.fetchall()
 
     known_relative_paths = folder_paths.get_filename_list(model_type)
+
     if not known_relative_paths:
         return []
 
-    full_path_map = {
-        os.path.normpath(folder_paths.get_full_path(model_type, f)): f
-        for f in known_relative_paths
-    }
+    full_path_map = {}
+
+    for relative_path in known_relative_paths:
+        full_path = folder_paths.get_full_path(model_type, relative_path)
+
+        if not full_path:
+            print(
+                f"[Civitai Toolkit] Warning: skipping unresolved "
+                f"{model_type} file: {relative_path}"
+            )
+            continue
+
+        full_path_map[os.path.normpath(full_path)] = relative_path
 
     db_relative_paths = []
+
     for row in rows:
-        full_path = os.path.normpath(row["local_path"])
+        local_path = row["local_path"]
+
+        if not local_path:
+            continue
+
+        full_path = os.path.normpath(local_path)
         relative_path = full_path_map.get(full_path)
+
         if relative_path:
             db_relative_paths.append(relative_path)
 
     if not db_relative_paths:
-        print(f"[Civitai Toolkit] No DB entries for {model_type}, showing all models from folder_paths")
-        return sorted(list(set(known_relative_paths)))
+        print(
+            f"[Civitai Toolkit] No DB entries for {model_type}, "
+            "showing all valid models from folder_paths"
+        )
 
-    return sorted(list(set(db_relative_paths)))
+        # Return only paths that actually resolve.
+        return sorted(set(full_path_map.values()))
 
+    return sorted(set(db_relative_paths))
 
 def get_model_filenames_from_db(model_type: str, force_sync=False):
     """
-    这是获取模型列表的权威函数。
-    它确保数据库已同步，然后基于数据库内容构建列表，
-    并与ComfyUI的已知路径交叉引用以确保准确性。
+    Authoritative function for retrieving the model list.
+
+    Ensures the database is synchronized, then builds the model list
+    from database contents while cross-referencing ComfyUI's known
+    model paths.
+
+    Invalid or unresolved ComfyUI paths are skipped safely instead of
+    causing the entire Civitai Toolkit import to fail.
     """
+
+    # Synchronize the DB with files currently visible to ComfyUI.
     sync_local_files_with_db(model_type, force=force_sync)
 
+    # Read all known absolute paths for this model type from the DB.
     with db_manager.get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT local_path FROM versions WHERE model_type = ? AND local_path IS NOT NULL ORDER BY local_path ASC",
+            """
+            SELECT local_path
+            FROM versions
+            WHERE model_type = ?
+              AND local_path IS NOT NULL
+            ORDER BY local_path ASC
+            """,
             (model_type,),
         )
         rows = cursor.fetchall()
 
+    # Get the model filenames ComfyUI currently knows about.
     known_relative_paths = folder_paths.get_filename_list(model_type)
-    full_path_map = {
-        os.path.normpath(folder_paths.get_full_path(model_type, f)): f
-        for f in known_relative_paths
-    }
 
+    if not known_relative_paths:
+        return []
+
+    # Build:
+    #
+    #   normalized absolute path -> ComfyUI relative model path
+    #
+    # get_full_path() can legitimately return None, for example for a
+    # broken symlink or invalid filesystem entry. Those entries must be
+    # skipped before calling normpath().
+    full_path_map = {}
+
+    for relative_path in known_relative_paths:
+        try:
+            full_path = folder_paths.get_full_path(
+                model_type,
+                relative_path,
+            )
+
+            if not full_path:
+                print(
+                    f"[Civitai Toolkit] Warning: skipping unresolved "
+                    f"{model_type} file: {relative_path}"
+                )
+                continue
+
+            # Extra defensive check. get_full_path() normally handles this,
+            # but this also avoids keeping broken/nonexistent filesystem entries.
+            if not os.path.exists(full_path):
+                print(
+                    f"[Civitai Toolkit] Warning: skipping missing "
+                    f"{model_type} file: {relative_path} -> {full_path}"
+                )
+                continue
+
+            if os.path.isdir(full_path):
+                print(
+                    f"[Civitai Toolkit] Warning: skipping directory in "
+                    f"{model_type} list: {relative_path}"
+                )
+                continue
+
+            normalized_full_path = os.path.normcase(
+                os.path.normpath(full_path)
+            )
+
+            full_path_map[normalized_full_path] = relative_path
+
+        except Exception as e:
+            print(
+                f"[Civitai Toolkit] Warning: could not resolve "
+                f"{model_type} file '{relative_path}': {e}"
+            )
+            continue
+
+    # Nothing resolved successfully.
+    if not full_path_map:
+        return []
+
+    # Cross-reference DB absolute paths with ComfyUI's currently valid paths.
     db_relative_paths = []
+
     for row in rows:
-        full_path = os.path.normpath(row["local_path"])
-        relative_path = full_path_map.get(full_path)
+        local_path = row["local_path"]
+
+        if not local_path:
+            continue
+
+        try:
+            normalized_db_path = os.path.normcase(
+                os.path.normpath(local_path)
+            )
+        except (TypeError, ValueError):
+            print(
+                f"[Civitai Toolkit] Warning: ignoring invalid DB path "
+                f"for {model_type}: {local_path!r}"
+            )
+            continue
+
+        relative_path = full_path_map.get(normalized_db_path)
+
         if relative_path:
             db_relative_paths.append(relative_path)
 
-    return sorted(list(set(db_relative_paths)))
-
+    return sorted(set(db_relative_paths))
 
 def get_legacy_cache_files():
     """返回所有存在的旧版缓存文件的路径字典"""
@@ -897,8 +1011,8 @@ def migrate_legacy_caches():
                     conn.execute(
                         """
                     INSERT INTO versions (hash, local_path, local_mtime, name, model_type) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET 
-                        local_path = excluded.local_path, 
+                    ON CONFLICT(hash) DO UPDATE SET
+                        local_path = excluded.local_path,
                         local_mtime = excluded.local_mtime,
                         model_type = excluded.model_type
                     """,
@@ -933,8 +1047,8 @@ def migrate_legacy_caches():
                     conn.execute(
                         """
                     INSERT INTO versions (hash, local_path, local_mtime, name, model_type) VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(hash) DO UPDATE SET 
-                        local_path = excluded.local_path, 
+                    ON CONFLICT(hash) DO UPDATE SET
+                        local_path = excluded.local_path,
                         local_mtime = excluded.local_mtime,
                         model_type = excluded.model_type
                     """,
@@ -1748,7 +1862,7 @@ def get_local_models_for_ui():
             if not folder:
                 continue
             folder = os.path.normpath(folder)
-            
+
             # Windows: Check if drives match first to avoid ValueError in commonpath
             if os.path.splitdrive(norm_path)[0].casefold() != os.path.splitdrive(folder)[0].casefold():
                 continue
